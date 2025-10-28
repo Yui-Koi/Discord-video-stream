@@ -11,6 +11,40 @@ import { prepareStream } from "./media/newApi.js";
 import { Encoders } from "./media/encoders/index.js";
 import Log from "debug-level";
 
+const controlLog = new Log("control");
+const httpLog = new Log("control:http");
+const wsLog = new Log("control:ws");
+const udpLog = new Log("control:udp");
+const ffLog = new Log("control:ffmpeg");
+const demuxLog = new Log("control:demux");
+const packetizerLog = new Log("control:packetizer");
+const streamLog = new Log("control:stream");
+const protoLog = new Log("control:proto");
+
+// Feature flags via env
+const LOG_HTTP_BODIES = (process.env.CONTROL_LOG_HTTP ?? "").toLowerCase() === "1";
+const LOG_WS_MESSAGES = (process.env.CONTROL_LOG_WS ?? "").toLowerCase() === "1";
+
+function redact(obj: unknown): unknown {
+    if (!obj || typeof obj !== "object") return obj;
+    try {
+        const clone = JSON.parse(JSON.stringify(obj));
+        const visit = (o: any) => {
+            if (!o || typeof o !== "object") return;
+            for (const k of Object.keys(o)) {
+                if (typeof o[k] === "object") visit(o[k]);
+                if (["token", "secret_key", "authorization"].includes(k.toLowerCase())) {
+                    o[k] = "<redacted>";
+                }
+            }
+        };
+        visit(clone);
+        return clone;
+    } catch {
+        return obj;
+    }
+}
+
 type StartGoLiveRequest = {
     guild_id: string;
     channel_id: string;
@@ -102,12 +136,13 @@ export async function startControlServer() {
         throw new Error("DISCORD_TOKEN env var not set");
     }
 
-    const controlLog = new Log("control");
-    const wsLog = new Log("control:ws");
-    const udpLog = new Log("control:udp");
-    const ffLog = new Log("control:ffmpeg");
-    const demuxLog = new Log("control:demux");
-    const packetizerLog = new Log("control:packetizer");
+    const streamer = new Streamer(new (await import("discord.js-selfbot-v13")).Client(), {
+        forceChacha20Encryption: false,
+        rtcpSenderReportEnabled: true,
+    });
+
+    await streamer.client.login(token);
+    controlLog.info({og = new Log("control:packetizer");
     const streamLog = new Log("control:stream");
 
     const streamer = new Streamer(new (await import("discord.js-selfbot-v13")).Client(), {
@@ -306,16 +341,34 @@ export async function startControlServer() {
     }
 
     const server = http.createServer(async (req, res) => {
+        const started = Date.now();
         try {
-            const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+            const host = req.headers.host ?? "localhost";
+            const url = new URL(req.url ?? "/", `http://${host}`);
+            httpLog.info({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams) }, "HTTP request");
+            // Body peek for logging (only JSON)
+            let bodyObj: any = undefined;
+            if (req.method === "POST" && (url.pathname === "/go-live/start" || url.pathname === "/go-live/stop")) {
+                try {
+                    bodyObj = await parseJsonBody(req);
+                    if (LOG_HTTP_BODIES) {
+                        httpLog.info({ body: redact(bodyObj) }, "HTTP body");
+                    }
+                } catch (e) {
+                    httpLog.error(e, "Failed parsing JSON body");
+                    jsonResponse(res, 400, { ok: false, error: "invalid json" });
+                    return;
+                }
+            }
+
             if (req.method === "POST" && url.pathname === "/go-live/start") {
-                const body = await parseJsonBody(req) as StartGoLiveRequest;
+                const body = bodyObj as StartGoLiveRequest;
                 await startGoLive(body);
                 jsonResponse(res, 200, { ok: true });
                 return;
             }
             if (req.method === "POST" && url.pathname === "/go-live/stop") {
-                const body = await parseJsonBody(req) as StopGoLiveRequest;
+                const body = bodyObj as StopGoLiveRequest;
                 const session = sessions.get(body.stream_key);
                 if (!session) {
                     jsonResponse(res, 404, { ok: false, error: "not found" });
@@ -342,11 +395,28 @@ export async function startControlServer() {
                 jsonResponse(res, 200, out);
                 return;
             }
+            if (req.method === "GET" && url.pathname === "/go-live/debug") {
+                // return debug info for all sessions
+                const all = [...sessions.values()].map(s => ({
+                    stream_key: s.streamKey,
+                    state: s.state,
+                    lastError: s.lastError,
+                    ws_present: !!s.conn.ws,
+                    udp_ready: s.conn.udp.ready,
+                    udp_ip: s.conn.udp.ip,
+                    udp_port: s.conn.udp.port,
+                    webRtcReady: !!s.conn.webRtcParams,
+                    encryptorSet: !!s.conn.transportEncryptor
+                }));
+                jsonResponse(res, 200, { ok: true, sessions: all });
+                return;
+            }
             jsonResponse(res, 404, { ok: false, error: "unknown route" });
         } catch (e) {
-            const controlLog = new Log("control");
             controlLog.error(e, "HTTP handler error");
             jsonResponse(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) });
+        } finally {
+            httpLog.info({ ms: Date.now() - started }, "HTTP request done");
         }
     });
 
