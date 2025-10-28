@@ -8,6 +8,7 @@ import { demux } from "./media/LibavDemuxer.js";
 import { AVCodecID } from "./media/LibavCodecId.js";
 import { SupportedVideoCodec, isFiniteNonZero } from "./utils.js";
 import { prepareStream } from "./media/newApi.js";
+import { Encoders } from "./media/encoders/index.js";
 import Log from "debug-level";
 
 type StartGoLiveRequest = {
@@ -224,8 +225,9 @@ export async function startControlServer() {
                 // Start ffmpeg producer
                 const abort = new AbortController();
                 session.abort = abort;
-                const prep = prepareStream(ffmpeg.input, ffmpeg.options ?? {}, abort.signal);
-                ffLog.info({ input: ffmpeg.input, options: ffmpeg.options }, "Started ffmpeg prepareStream");
+                const encoderGetter = (ffmpeg.options?.encoder === "nvenc") ? Encoders.nvenc() : Encoders.software();
+                const prep = prepareStream(ffmpeg.input, { ...(ffmpeg.options ?? {}), encoder: encoderGetter }, abort.signal);
+                ffLog.info({ input: ffmpeg.input, options: ffmpeg.options, encoder: ffmpeg.options?.encoder }, "Started ffmpeg prepareStream");
 
                 // Demux producer output
                 const { video, audio } = await demux(prep.output, { format: "nut" });
