@@ -51,7 +51,7 @@ streamer.client.on("messageCreate", async (msg) => {
             console.log("An error happened with ffmpeg");
             console.log(err);
         });
-        await playStream(output, streamer, undefined, controller.signal)
+        await playStream(output, streamer, { type: "go-live" }, controller.signal)
             .catch(() => controller.abort());
     } else if (msg.content.startsWith("$play-cam")) {
         const args = parseArgs(msg.content);
@@ -85,7 +85,11 @@ streamer.client.on("messageCreate", async (msg) => {
             console.log("An error happened with ffmpeg");
             console.log(err);
         });
-        await playStream(output, streamer, undefined, controller.signal)
+
+        // Signal camera stream before sending media
+        await streamer.client.signalVideo(msg.guildId!, channel.id, true);
+
+        await playStream(output, streamer, { type: "camera" }, controller.signal)
             .catch(() => controller.abort());
     } else if (msg.content.startsWith("$disconnect")) {
         controller?.abort();
