@@ -8,6 +8,7 @@ import { demux } from "./media/LibavDemuxer.js";
 import { AVCodecID } from "./media/LibavCodecId.js";
 import { SupportedVideoCodec, isFiniteNonZero } from "./utils.js";
 import { prepareStream } from "./media/newApi.js";
+import Log from "debug-level";
 
 type StartGoLiveRequest = {
     guild_id: string;
@@ -63,7 +64,7 @@ type GoLiveSession = {
     state: StatusResponse["state"];
     lastError?: string;
     cleanupFns: (() => void)[];
-    ffmpegCleanup?: () => void;
+    abort?: AbortController;
     stop: () => Promise<void>;
 };
 
@@ -100,12 +101,21 @@ export async function startControlServer() {
         throw new Error("DISCORD_TOKEN env var not set");
     }
 
+    const controlLog = new Log("control");
+    const wsLog = new Log("control:ws");
+    const udpLog = new Log("control:udp");
+    const ffLog = new Log("control:ffmpeg");
+    const demuxLog = new Log("control:demux");
+    const packetizerLog = new Log("control:packetizer");
+    const streamLog = new Log("control:stream");
+
     const streamer = new Streamer(new (await import("discord.js-selfbot-v13")).Client(), {
         forceChacha20Encryption: false,
         rtcpSenderReportEnabled: true,
     });
 
     await streamer.client.login(token);
+    controlLog.info({ user: streamer.client.user?.id }, "Logged in to Discord");
 
     const sessions = new Map<string, GoLiveSession>();
 
@@ -114,7 +124,7 @@ export async function startControlServer() {
             guild_id, channel_id, user_id,
             session_id, stream_key, rtc_server_id,
             endpoint, token: voiceToken,
-            video: videoAttrs, encryptionPreference, ffmpeg
+            video: vidAttrs, encryptionPreference, ffmpeg
         } = payload;
 
         if (sessions.has(stream_key)) {
@@ -124,12 +134,13 @@ export async function startControlServer() {
             throw new Error("Logged-in user does not match provided user_id");
         }
 
+        // Create StreamConnection using provided session/tokens (no gateway signaling here)
         const conn = new StreamConnection(
             streamer,
             guild_id,
             user_id,
             channel_id,
-            () => { /* ready callback not used */ }
+            () => { /* resolved later */ }
         );
         conn.serverId = rtc_server_id;
         conn.streamKey = stream_key;
@@ -141,147 +152,107 @@ export async function startControlServer() {
             conn,
             state: "starting",
             cleanupFns: [],
+            abort: undefined,
             stop: async () => {
-                try {
-                    conn.setSpeaking(false);
-                    conn.setVideoAttributes(false);
-                } catch {}
-                if (session.ffmpegCleanup) {
-                    try { session.ffmpegCleanup(); } catch {}
-                }
+                try { conn.setSpeaking(false); } catch {}
+                try { conn.setVideoAttributes(false); } catch {}
+                try { session.abort?.abort(); } catch {}
                 try { conn.udp?.stop(); } catch {}
                 try { conn.stop(); } catch {}
                 for (const f of session.cleanupFns) {
                     try { f(); } catch {}
                 }
+                controlLog.info({ stream_key }, "Stopped Go Live session");
                 session.state = "stopped";
             }
         };
         sessions.set(stream_key, session);
 
+        // Encryption preference tweak
         if (encryptionPreference === "XCHACHA20") {
             streamer.opts.forceChacha20Encryption = true;
         } else if (encryptionPreference === "AES256") {
             streamer.opts.forceChacha20Encryption = false;
         }
 
+        controlLog.info({
+            guild_id, channel_id, user_id, rtc_server_id, endpoint,
+            video: vidAttrs, encryptionPreference
+        }, "Starting Go Live handoff");
+
+        // Attach WS lifecycle logging (if available)
+        const attachWsLogs = () => {
+            const ws = conn.ws;
+            if (!ws) return;
+            ws.on("open", () => wsLog.info("Voice WS open"));
+            ws.on("error", (err) => wsLog.error(err, "Voice WS error"));
+            ws.on("close", (code) => wsLog.warn({ code }, "Voice WS close"));
+        };
+        // try initial attach, and re-attach after small delay in case ws not ready
+        attachWsLogs();
+        setTimeout(attachWsLogs, 500);
+
+        // Wait loop helper
+        const waitFor = async (pred: () => boolean, timeoutMs: number, label: string) => {
+            const start = Date.now();
+            while (Date.now() - start < timeoutMs) {
+                if (pred()) return true;
+                await new Promise(r => setTimeout(r, 50));
+            }
+            controlLog.warn({ label }, "WaitFor timed out");
+            return false;
+        };
+
+        // Once the SELECT_PROTOCOL_ACK is received, configure and start media
         conn.once("select_protocol_ack", async () => {
             try {
-                // Mark speaking as Go Live (speaking: 2)
+                protoLog.info("Received SELECT_PROTOCOL_ACK");
+
+                // Wait until UDP is ready
+                const udpReady = await waitFor(() => conn.udp.ready, 5000, "udp.ready");
+                udpLog.info({ ready: udpReady, ip: conn.udp.ip, port: conn.udp.port }, "UDP readiness");
+
+                // speaking: 2 (go-live)
                 conn.setSpeaking(true);
+                controlLog.info("Set speaking=2 (go-live)");
 
-                // Set video attributes from handoff
-                const w = isFiniteNonZero(videoAttrs?.width) ? Math.round(videoAttrs!.width!) : 1280;
-                const h = isFiniteNonZero(videoAttrs?.height) ? Math.round(videoAttrs!.height!) : 720;
-                const fps = isFiniteNonZero(videoAttrs?.fps) ? Math.round(videoAttrs!.fps!) : 30;
-                conn.setVideoAttributes(true, { width: w, height: h, fps });
+                // Use provided video attrs if any; else will infer after demux
+                const cfgWidth = isFiniteNonZero(vidAttrs?.width) ? Math.round(vidAttrs!.width!) : undefined;
+                const cfgHeight = isFiniteNonZero(vidAttrs?.height) ? Math.round(vidAttrs!.height!) : undefined;
+                const cfgFps = isFiniteNonZero(vidAttrs?.fps) ? Math.round(vidAttrs!.fps!) : undefined;
 
-                // Prepare ffmpeg pipeline -> NUT -> demux -> VideoStream/AudioStream
-                const { default: ffmpegLib } = await import("fluent-ffmpeg");
-                const { PassThrough } = await import("node:stream");
-                const output = new PassThrough();
+                // Start ffmpeg producer
+                const abort = new AbortController();
+                session.abort = abort;
+                const prep = prepareStream(ffmpeg.input, ffmpeg.options ?? {}, abort.signal);
+                ffLog.info({ input: ffmpeg.input, options: ffmpeg.options }, "Started ffmpeg prepareStream");
 
-                const command = ffmpegLib(ffmpeg.input)
-                    .addOption("-loglevel", "info");
+                // Demux producer output
+                const { video, audio } = await demux(prep.output, { format: "nut" });
+                if (!video) throw new Error("No video stream");
+                demuxLog.info({
+                    width: video.width, height: video.height,
+                    framerate_num: video.framerate_num, framerate_den: video.framerate_den,
+                    codec: video.codec
+                }, "Demuxed video stream");
 
-                const opts = ffmpeg.options ?? {};
-                const merged = {
-                    width: opts.width,
-                    height: opts.height,
-                    frameRate: opts.frameRate,
-                    bitrateVideo: opts.bitrateVideo ?? 5000,
-                    bitrateVideoMax: opts.bitrateVideoMax ?? 7000,
-                    bitrateAudio: opts.bitrateAudio ?? 128,
-                    includeAudio: opts.includeAudio ?? true,
-                    hardwareAcceleratedDecoding: opts.hardwareAcceleratedDecoding ?? false,
-                    minimizeLatency: opts.minimizeLatency ?? false,
-                    customHeaders: opts.customHeaders ?? {
-                        "User-Agent": "Mozilla/5.0",
-                        "Connection": "keep-alive",
-                    },
-                    customFfmpegFlags: opts.customFfmpegFlags ?? [],
-                    encoder: opts.encoder ?? "software",
-                };
+                const inferredWidth = video.width ?? 1280;
+                const inferredHeight = video.height ?? 720;
+                const inferredFps = Math.round((video.framerate_num / video.framerate_den) || 30);
 
-                if (merged.hardwareAcceleratedDecoding) {
-                    command.inputOption("-hwaccel", "auto");
-                }
-                if (merged.minimizeLatency) {
-                    command.addOptions(["-fflags nobuffer", "-analyzeduration 0"]);
-                }
-                if (ffmpeg.input.startsWith("http")) {
-                    command.inputOption(
-                        "-headers",
-                        Object.entries(merged.customHeaders)
-                            .map(([k, v]) => `${k}: ${v}`)
-                            .join("\r\n")
-                    );
-                }
-
-                command.output(output).outputFormat("nut");
-
-                // Video setup
-                command.addOutputOption("-map 0:v");
-                if (merged.width || merged.height) {
-                    const wOpt = isFiniteNonZero(merged.width) ? merged.width : -2;
-                    const hOpt = isFiniteNonZero(merged.height) ? merged.height : -2;
-                    command.videoFilter(`scale=${wOpt}:${hOpt}`);
-                }
-                if (merged.frameRate) {
-                    command.fpsOutput(merged.frameRate);
-                }
-                command.addOutputOption([
-                    "-b:v", `${merged.bitrateVideo}k`,
-                    "-maxrate:v", `${merged.bitrateVideoMax}k`,
-                    "-bf", "0",
-                    "-pix_fmt", "yuv420p",
-                    "-force_key_frames", "expr:gte(t,n_forced*1)"
-                ]);
-
-                // Encoder selection
-                if (merged.encoder === "nvenc") {
-                    command.videoCodec("h264_nvenc").outputOptions(["-preset", "p4"]);
-                } else {
-                    command.videoCodec("libx264").outputOptions(["-preset", "veryfast"]);
-                }
-
-                // Audio setup
-                if (merged.includeAudio) {
-                    command.addOutputOption("-map 0:a?");
-                    command.audioChannels(2);
-                    command.addOutputOption("-lfe_mix_level 1");
-                    command.audioFrequency(48000);
-                    command.audioCodec("libopus");
-                    command.audioBitrate(`${merged.bitrateAudio}k`);
-                }
-
-                if (merged.customFfmpegFlags.length > 0) {
-                    command.addOptions(merged.customFfmpegFlags);
-                }
-
-                const onError = (e: unknown) => {
-                    session.state = "error";
-                    session.lastError = e instanceof Error ? e.message : String(e);
-                };
-                command.on("error", onError);
-                command.on("end", () => {
-                    if (session.state !== "stopping" && session.state !== "stopped") {
-                        session.state = "stopped";
-                    }
+                // Set video attributes AFTER ACK and UDP ready
+                conn.setVideoAttributes(true, {
+                    width: cfgWidth ?? inferredWidth,
+                    height: cfgHeight ?? inferredHeight,
+                    fps: cfgFps ?? inferredFps
                 });
+                controlLog.info({
+                    width: cfgWidth ?? inferredWidth,
+                    height: cfgHeight ?? inferredHeight,
+                    fps: cfgFps ?? inferredFps
+                }, "Sent VIDEO attributes");
 
-                command.run();
-
-                // allow stop to kill ffmpeg and output
-                session.ffmpegCleanup = () => {
-                    try { command.kill("SIGTERM"); } catch {}
-                    try { output.destroy(); } catch {}
-                };
-
-                // Demux and pipe
-                const { video: vInfo, audio } = await demux(output, { format: "nut" });
-                if (!vInfo) throw new Error("No video stream");
-
+                // Select packetizer by codec
                 const codecMap: Record<number, SupportedVideoCodec> = {
                     [AVCodecID.AV_CODEC_ID_H264]: "H264",
                     [AVCodecID.AV_CODEC_ID_H265]: "H265",
@@ -289,24 +260,43 @@ export async function startControlServer() {
                     [AVCodecID.AV_CODEC_ID_VP9]: "VP9",
                     [AVCodecID.AV_CODEC_ID_AV1]: "AV1"
                 };
-                const codec = codecMap[vInfo.codec] ?? "H264";
+                const codec = codecMap[video.codec] ?? "H264";
+                packetizerLog.info({ codec }, "Selected packetizer codec");
 
                 const udp = conn.udp;
                 udp.setPacketizer(codec);
 
+                // Pipe data to RTP
                 const vStream = new VideoStream(udp);
                 session.cleanupFns.push(() => vStream.destroy());
-                vInfo.stream.pipe(vStream);
+                video.stream.pipe(vStream);
+                streamLog.info("Piping video stream to RTP");
 
                 if (audio) {
                     const aStream = new AudioStream(udp);
                     session.cleanupFns.push(() => aStream.destroy());
                     audio.stream.pipe(aStream);
                     vStream.syncStream = aStream;
+                    streamLog.info("Piping audio stream to RTP and enabling A/V sync");
                 }
 
                 session.state = "running";
+                controlLog.info("Session state -> running");
+
+                // Observe ffmpeg completion/errors
+                prep.promise.then(() => {
+                    ffLog.info("ffmpeg pipeline ended");
+                    if (session.state === "running") {
+                        session.state = "stopped";
+                        controlLog.info("Session state -> stopped");
+                    }
+                }).catch((e) => {
+                    ffLog.error(e, "ffmpeg pipeline error");
+                    session.state = "error";
+                    session.lastError = e instanceof Error ? e.message : String(e);
+                });
             } catch (e) {
+                controlLog.error(e, "Error in select_protocol_ack handler");
                 session.state = "error";
                 session.lastError = e instanceof Error ? e.message : String(e);
             }
@@ -330,6 +320,7 @@ export async function startControlServer() {
                     return;
                 }
                 session.state = "stopping";
+                controlLog.info({ stream_key: body.stream_key }, "Stopping Go Live session");
                 await session.stop();
                 sessions.delete(body.stream_key);
                 jsonResponse(res, 200, { ok: true });
@@ -351,22 +342,29 @@ export async function startControlServer() {
             }
             jsonResponse(res, 404, { ok: false, error: "unknown route" });
         } catch (e) {
+            const controlLog = new Log("control");
+            controlLog.error(e, "HTTP handler error");
             jsonResponse(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) });
         }
     });
 
     const port = Number(process.env.PORT ?? 3000);
     server.listen(port, () => {
-        console.log(`Control server listening on http://localhost:${port}`);
+        const controlLog = new Log("control");
+        controlLog.info({ port }, `Control server listening on http://localhost:${port}`);
     });
 
     return { server, streamer };
 }
 
+// Proto logger for protocol ACK steps
+const protoLog = new Log("control:proto");
+
 // Auto-start if invoked directly
 if (import.meta.url === `file://${process.argv[1]}`) {
+    const controlLog = new Log("control");
     startControlServer().catch((e) => {
-        console.error(e);
+        controlLog.error(e, "Failed to start control server");
         process.exit(1);
     });
 }
