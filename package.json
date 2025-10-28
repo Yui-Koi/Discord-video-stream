@@ -41,6 +41,7 @@
     },
     "scripts": {
         "build": "tsc",
+        "start:control": "node dist/controlServer.js",
         "lint": "biome lint --error-on-warnings .",
         "lint:fix": "biome lint --write ."
     },
