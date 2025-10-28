@@ -7,6 +7,7 @@ import { AudioStream } from "./media/AudioStream.js";
 import { demux } from "./media/LibavDemuxer.js";
 import { AVCodecID } from "./media/LibavCodecId.js";
 import { SupportedVideoCodec, isFiniteNonZero } from "./utils.js";
+import { prepareStream } from "./media/newApi.js";
 
 type StartGoLiveRequest = {
     guild_id: string;
@@ -35,8 +36,7 @@ type StartGoLiveRequest = {
             includeAudio?: boolean;
             encoder?: "software" | "nvenc";
             hardwareAcceleratedDecoding?: boolean;
-            minimizeLatency?: boolean;
-            customHeaders?: Record<string, string>;
+            minimizeLatencyng, string>;
             customFfmpegFlags?: string[];
         };
     };
