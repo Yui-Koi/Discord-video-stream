@@ -36,7 +36,8 @@ type StartGoLiveRequest = {
             includeAudio?: boolean;
             encoder?: "software" | "nvenc";
             hardwareAcceleratedDecoding?: boolean;
-            minimizeLatencyng, string>;
+            minimizeLatency?: boolean;
+            customHeaders?: Record<string, string>;
             customFfmpegFlags?: string[];
         };
     };
