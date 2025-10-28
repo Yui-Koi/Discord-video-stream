@@ -407,10 +407,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         controlLog.error(e, "Failed to start control server");
         process.exit(1);
     });
-}`) {
-    const controlLog = new Log("control");
-    startControlServer().catch((e) => {
-        controlLog.error(e, "Failed to start control server");
-        process.exit(1);
-    });
 }
