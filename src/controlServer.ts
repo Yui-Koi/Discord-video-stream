@@ -1,7 +1,6 @@
 import http from "node:http";
 import { URL } from "node:url";
 import { StreamConnection } from "./client/voice/StreamConnection.js";
-import { VoiceOpCodes } from "./client/voice/VoiceOpCodes.js";
 import { Streamer } from "./client/Streamer.js";
 import { VideoStream } from "./media/VideoStream.js";
 import { AudioStream } from "./media/AudioStream.js";
@@ -63,6 +62,7 @@ type GoLiveSession = {
     state: StatusResponse["state"];
     lastError?: string;
     cleanupFns: (() => void)[];
+    ffmpegCleanup?: () => void;
     stop: () => Promise<void>;
 };
 
@@ -100,7 +100,6 @@ export async function startControlServer() {
     }
 
     const streamer = new Streamer(new (await import("discord.js-selfbot-v13")).Client(), {
-        // Allow external preference; default follows library behavior
         forceChacha20Encryption: false,
         rtcpSenderReportEnabled: true,
     });
@@ -114,7 +113,7 @@ export async function startControlServer() {
             guild_id, channel_id, user_id,
             session_id, stream_key, rtc_server_id,
             endpoint, token: voiceToken,
-            video, encryptionPreference, ffmpeg
+            video: videoAttrs, encryptionPreference, ffmpeg
         } = payload;
 
         if (sessions.has(stream_key)) {
@@ -124,14 +123,12 @@ export async function startControlServer() {
             throw new Error("Logged-in user does not match provided user_id");
         }
 
-        // Instantiate a StreamConnection without signaling STREAM_CREATE;
-        // set serverId, streamKey, session/tokens from handoff payload.
         const conn = new StreamConnection(
             streamer,
             guild_id,
             user_id,
             channel_id,
-            () => { /* ready callback handled below */ }
+            () => { /* ready callback not used */ }
         );
         conn.serverId = rtc_server_id;
         conn.streamKey = stream_key;
@@ -145,14 +142,14 @@ export async function startControlServer() {
             cleanupFns: [],
             stop: async () => {
                 try {
-                    // Signal stream deletion and disable media
-                    conn.sendOpcode(VoiceOpCodes.STREAM_DELETE, { stream_key });
                     conn.setSpeaking(false);
                     conn.setVideoAttributes(false);
                 } catch {}
+                if (session.ffmpegCleanup) {
+                    try { session.ffmpegCleanup(); } catch {}
+                }
                 try { conn.udp?.stop(); } catch {}
                 try { conn.stop(); } catch {}
-                // Run cleanups
                 for (const f of session.cleanupFns) {
                     try { f(); } catch {}
                 }
@@ -161,57 +158,48 @@ export async function startControlServer() {
         };
         sessions.set(stream_key, session);
 
-        // Encryption preference tweak
         if (encryptionPreference === "XCHACHA20") {
             streamer.opts.forceChacha20Encryption = true;
         } else if (encryptionPreference === "AES256") {
             streamer.opts.forceChacha20Encryption = false;
         }
 
-        // Once the SELECT_PROTOCOL_ACK is received, configure attributes
         conn.once("select_protocol_ack", async () => {
             try {
                 // Mark speaking as Go Live (speaking: 2)
                 conn.setSpeaking(true);
 
-                // Set video attributes
-                const w = isFiniteNonZero(video?.width) ? Math.round(video!.width!) : 1280;
-                const h = isFiniteNonZero(video?.height) ? Math.round(video!.height!) : 720;
-                const fps = isFiniteNonZero(video?.fps) ? Math.round(video!.fps!) : 30;
-
+                // Set video attributes from handoff
+                const w = isFiniteNonZero(videoAttrs?.width) ? Math.round(videoAttrs!.width!) : 1280;
+                const h = isFiniteNonZero(videoAttrs?.height) ? Math.round(videoAttrs!.height!) : 720;
+                const fps = isFiniteNonZero(videoAttrs?.fps) ? Math.round(videoAttrs!.fps!) : 30;
                 conn.setVideoAttributes(true, { width: w, height: h, fps });
 
-                // Prepare ffmpeg pipeline
+                // Prepare ffmpeg pipeline -> NUT -> demux -> VideoStream/AudioStream
                 const { default: ffmpegLib } = await import("fluent-ffmpeg");
-                // We reuse the demux + VideoStream/AudioStream path instead of playStream() to avoid gateway signaling
-                const input = ffmpeg.input;
-                const inputSpec = ffmpeg.input; // Not used directly; we build command via newApi-like logic
-
-                // Build a similar pipeline: run ffmpeg producing NUT, then demux and pipe
                 const { PassThrough } = await import("node:stream");
                 const output = new PassThrough();
 
-                const command = ffmpegLib(ffmpeg.input ? ffmpeg.input : ffmpeg.input)
-                    .addOption("-loglevel", "info")
-                    .input(ffmpeg.input ? ffmpeg.input : ffmpeg.input);
+                const command = ffmpegLib(ffmpeg.input)
+                    .addOption("-loglevel", "info");
 
-                // Configure input
+                const opts = ffmpeg.options ?? {};
                 const merged = {
-                    width: ffmpeg.options?.width,
-                    height: ffmpeg.options?.height,
-                    frameRate: ffmpeg.options?.frameRate,
-                    bitrateVideo: ffmpeg.options?.bitrateVideo ?? 5000,
-                    bitrateVideoMax: ffmpeg.options?.bitrateVideoMax ?? 7000,
-                    bitrateAudio: ffmpeg.options?.bitrateAudio ?? 128,
-                    includeAudio: ffmpeg.options?.includeAudio ?? true,
-                    hardwareAcceleratedDecoding: ffmpeg.options?.hardwareAcceleratedDecoding ?? false,
-                    minimizeLatency: ffmpeg.options?.minimizeLatency ?? false,
-                    customHeaders: ffmpeg.options?.customHeaders ?? {
+                    width: opts.width,
+                    height: opts.height,
+                    frameRate: opts.frameRate,
+                    bitrateVideo: opts.bitrateVideo ?? 5000,
+                    bitrateVideoMax: opts.bitrateVideoMax ?? 7000,
+                    bitrateAudio: opts.bitrateAudio ?? 128,
+                    includeAudio: opts.includeAudio ?? true,
+                    hardwareAcceleratedDecoding: opts.hardwareAcceleratedDecoding ?? false,
+                    minimizeLatency: opts.minimizeLatency ?? false,
+                    customHeaders: opts.customHeaders ?? {
                         "User-Agent": "Mozilla/5.0",
                         "Connection": "keep-alive",
                     },
-                    customFfmpegFlags: ffmpeg.options?.customFfmpegFlags ?? [],
-                    encoder: ffmpeg.options?.encoder ?? "software",
+                    customFfmpegFlags: opts.customFfmpegFlags ?? [],
+                    encoder: opts.encoder ?? "software",
                 };
 
                 if (merged.hardwareAcceleratedDecoding) {
@@ -221,12 +209,14 @@ export async function startControlServer() {
                     command.addOptions(["-fflags nobuffer", "-analyzeduration 0"]);
                 }
                 if (ffmpeg.input.startsWith("http")) {
-                    command.inputOption("-headers",
-                        Object.entries(merged.customHeaders).map(([k, v]) => `${k}: ${v}`).join("\r\n")
+                    command.inputOption(
+                        "-headers",
+                        Object.entries(merged.customHeaders)
+                            .map(([k, v]) => `${k}: ${v}`)
+                            .join("\r\n")
                     );
                 }
 
-                // Output setup
                 command.output(output).outputFormat("nut");
 
                 // Video setup
@@ -247,9 +237,12 @@ export async function startControlServer() {
                     "-force_key_frames", "expr:gte(t,n_forced*1)"
                 ]);
 
-                // Encoder selection minimal: stick to libx264 for H264 and libvpx for VP8 if needed
-                // For simplicity, use H264 software encoder
-                command.videoCodec("libx264").outputOptions(["-preset", "veryfast"]);
+                // Encoder selection
+                if (merged.encoder === "nvenc") {
+                    command.videoCodec("h264_nvenc").outputOptions(["-preset", "p4"]);
+                } else {
+                    command.videoCodec("libx264").outputOptions(["-preset", "veryfast"]);
+                }
 
                 // Audio setup
                 if (merged.includeAudio) {
@@ -269,10 +262,8 @@ export async function startControlServer() {
                     session.state = "error";
                     session.lastError = e instanceof Error ? e.message : String(e);
                 };
-
                 command.on("error", onError);
                 command.on("end", () => {
-                    // finished naturally
                     if (session.state !== "stopping" && session.state !== "stopped") {
                         session.state = "stopped";
                     }
@@ -280,11 +271,16 @@ export async function startControlServer() {
 
                 command.run();
 
-                // Demux and pipe
-                const { video, audio } = await demux(output, { format: "nut" });
-                if (!video) throw new Error("No video stream");
+                // allow stop to kill ffmpeg and output
+                session.ffmpegCleanup = () => {
+                    try { command.kill("SIGTERM"); } catch {}
+                    try { output.destroy(); } catch {}
+                };
 
-                // Map codec to packetizer
+                // Demux and pipe
+                const { video: vInfo, audio } = await demux(output, { format: "nut" });
+                if (!vInfo) throw new Error("No video stream");
+
                 const codecMap: Record<number, SupportedVideoCodec> = {
                     [AVCodecID.AV_CODEC_ID_H264]: "H264",
                     [AVCodecID.AV_CODEC_ID_H265]: "H265",
@@ -292,16 +288,14 @@ export async function startControlServer() {
                     [AVCodecID.AV_CODEC_ID_VP9]: "VP9",
                     [AVCodecID.AV_CODEC_ID_AV1]: "AV1"
                 };
-                const codec = codecMap[video.codec] ?? "H264";
+                const codec = codecMap[vInfo.codec] ?? "H264";
 
-                // Prepare UDP and packetizers
                 const udp = conn.udp;
                 udp.setPacketizer(codec);
 
                 const vStream = new VideoStream(udp);
                 session.cleanupFns.push(() => vStream.destroy());
-
-                video.stream.pipe(vStream);
+                vInfo.stream.pipe(vStream);
 
                 if (audio) {
                     const aStream = new AudioStream(udp);
