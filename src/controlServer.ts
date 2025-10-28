@@ -142,15 +142,6 @@ export async function startControlServer() {
     });
 
     await streamer.client.login(token);
-    controlLog.info({og = new Log("control:packetizer");
-    const streamLog = new Log("control:stream");
-
-    const streamer = new Streamer(new (await import("discord.js-selfbot-v13")).Client(), {
-        forceChacha20Encryption: false,
-        rtcpSenderReportEnabled: true,
-    });
-
-    await streamer.client.login(token);
     controlLog.info({ user: streamer.client.user?.id }, "Logged in to Discord");
 
     const sessions = new Map<string, GoLiveSession>();
@@ -223,6 +214,17 @@ export async function startControlServer() {
             ws.on("open", () => wsLog.info("Voice WS open"));
             ws.on("error", (err) => wsLog.error(err, "Voice WS error"));
             ws.on("close", (code) => wsLog.warn({ code }, "Voice WS close"));
+            if (LOG_WS_MESSAGES) {
+                ws.on("message", (data, isBinary) => {
+                    if (isBinary) return;
+                    try {
+                        const msg = JSON.parse(String(data));
+                        wsLog.debug({ op: msg?.op, keys: Object.keys(msg || {}) }, "Voice WS message");
+                    } catch {
+                        wsLog.debug("Voice WS message (non-JSON)");
+                    }
+                });
+            }
         };
         // try initial attach, and re-attach after small delay in case ws not ready
         attachWsLogs();
@@ -341,34 +343,23 @@ export async function startControlServer() {
     }
 
     const server = http.createServer(async (req, res) => {
-        const started = Date.now();
         try {
-            const host = req.headers.host ?? "localhost";
-            const url = new URL(req.url ?? "/", `http://${host}`);
-            httpLog.info({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams) }, "HTTP request");
-            // Body peek for logging (only JSON)
-            let bodyObj: any = undefined;
-            if (req.method === "POST" && (url.pathname === "/go-live/start" || url.pathname === "/go-live/stop")) {
-                try {
-                    bodyObj = await parseJsonBody(req);
-                    if (LOG_HTTP_BODIES) {
-                        httpLog.info({ body: redact(bodyObj) }, "HTTP body");
-                    }
-                } catch (e) {
-                    httpLog.error(e, "Failed parsing JSON body");
-                    jsonResponse(res, 400, { ok: false, error: "invalid json" });
-                    return;
-                }
-            }
-
+            const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+            httpLog.info({ method: req.method, path: url.pathname }, "HTTP request");
             if (req.method === "POST" && url.pathname === "/go-live/start") {
-                const body = bodyObj as StartGoLiveRequest;
+                const body = await parseJsonBody(req) as StartGoLiveRequest;
+                if (LOG_HTTP_BODIES) {
+                    httpLog.info({ body: redact(body) }, "Start request body");
+                }
                 await startGoLive(body);
                 jsonResponse(res, 200, { ok: true });
                 return;
             }
             if (req.method === "POST" && url.pathname === "/go-live/stop") {
-                const body = bodyObj as StopGoLiveRequest;
+                const body = await parseJsonBody(req) as StopGoLiveRequest;
+                if (LOG_HTTP_BODIES) {
+                    httpLog.info({ body: redact(body) }, "Stop request body");
+                }
                 const session = sessions.get(body.stream_key);
                 if (!session) {
                     jsonResponse(res, 404, { ok: false, error: "not found" });
@@ -383,6 +374,7 @@ export async function startControlServer() {
             }
             if (req.method === "GET" && url.pathname === "/go-live/status") {
                 const stream_key = url.searchParams.get("stream_key") ?? "";
+                httpLog.debug({ stream_key }, "Status request");
                 const session = sessions.get(stream_key);
                 if (!session) {
                     jsonResponse(res, 404, { ok: false, error: "not found" });
@@ -395,45 +387,28 @@ export async function startControlServer() {
                 jsonResponse(res, 200, out);
                 return;
             }
-            if (req.method === "GET" && url.pathname === "/go-live/debug") {
-                // return debug info for all sessions
-                const all = [...sessions.values()].map(s => ({
-                    stream_key: s.streamKey,
-                    state: s.state,
-                    lastError: s.lastError,
-                    ws_present: !!s.conn.ws,
-                    udp_ready: s.conn.udp.ready,
-                    udp_ip: s.conn.udp.ip,
-                    udp_port: s.conn.udp.port,
-                    webRtcReady: !!s.conn.webRtcParams,
-                    encryptorSet: !!s.conn.transportEncryptor
-                }));
-                jsonResponse(res, 200, { ok: true, sessions: all });
-                return;
-            }
             jsonResponse(res, 404, { ok: false, error: "unknown route" });
         } catch (e) {
             controlLog.error(e, "HTTP handler error");
             jsonResponse(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) });
-        } finally {
-            httpLog.info({ ms: Date.now() - started }, "HTTP request done");
         }
     });
 
     const port = Number(process.env.PORT ?? 3000);
     server.listen(port, () => {
-        const controlLog = new Log("control");
         controlLog.info({ port }, `Control server listening on http://localhost:${port}`);
     });
 
     return { server, streamer };
 }
 
-// Proto logger for protocol ACK steps
-const protoLog = new Log("control:proto");
-
 // Auto-start if invoked directly
 if (import.meta.url === `file://${process.argv[1]}`) {
+    startControlServer().catch((e) => {
+        controlLog.error(e, "Failed to start control server");
+        process.exit(1);
+    });
+}`) {
     const controlLog = new Log("control");
     startControlServer().catch((e) => {
         controlLog.error(e, "Failed to start control server");
