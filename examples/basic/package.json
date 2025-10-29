@@ -16,6 +16,7 @@
     "scripts": {
         "build": "tsc",
         "start": "node ./dist/index.js",
+        "start:control-client": "node ./dist/controlClient.js",
         "yeet": "npm run build && npm run start"
     },
     "author": "",
