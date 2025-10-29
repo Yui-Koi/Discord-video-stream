@@ -47,8 +47,8 @@ streamer.client.on("messageCreate", async (msg) => {
             hardwareAcceleratedDecoding: config.streamOpts.hardware_acceleration,
             videoCodec: Utils.normalizeVideoCodec(config.streamOpts.videoCodec)
         }, controller.signal);
-        command.on("error", (err) => {
-            console.log("An error happened with ffmpeg");
+        command.on("error", (err: unknown) => {
+            console.log("Anppened with ffmpeg");
             console.log(err);
         });
         await playStream(output, streamer, undefined, controller.signal)
