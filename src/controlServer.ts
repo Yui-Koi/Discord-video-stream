@@ -400,8 +400,9 @@ export async function startControlServer() {
     });
 
     return { server, streamer };
-}>
-// Auto-start if invoked directly
+}
+
+ // Auto-start if invoked directly
 if (import.meta.url === `file://${process.argv[1]}`) {
     startControlServer().catch((e) => {
         controlLog.error(e, "Failed to start control server");
