@@ -1,0 +1,14 @@
+{
+  "token": "SELF TOKEN HERE",
+  "acceptedAuthors": ["USER_ID_HERE"],
+  "serverUrl": "http://localhost:4000",
+  "streamOpts": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "bitrateKbps": 1500,
+    "maxBitrateKbps": 2500,
+    "hardware_acceleration": false,
+    "videoCodec": "H264"
+  }
+}

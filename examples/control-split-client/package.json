@@ -1,0 +1,20 @@
+{
+  "name": "@dank074/discord-video-stream-control-split-client",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/client.js",
+  "types": "dist/client.d.ts",
+  "private": true,
+  "dependencies": {
+    "@dank074/discord-video-stream": "^5.0.0",
+    "discord.js-selfbot-v13": "^3.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "typescript": "^5.7.2"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node ./dist/client.js"
+  }
+}
